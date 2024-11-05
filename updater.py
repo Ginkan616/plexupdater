@@ -8,13 +8,18 @@ import time
 import configparser
 import schedule
 import threading
-from typing import Optional
+import json
+import os
 
 # Configuration du fichier (remplacez par votre chemin)
 CONFIG_FILE = "config.ini"
 
 # Objet de configuration
 config = configparser.ConfigParser()
+
+# fichier newmovies.txt pour stocker les titres et années des films pour la journée
+newmoviestxt = open("newmovies.txt", "a")
+newmoviessize = os.path.getsize('newmovies.txt')
 
 # Lecture de la configuration à partir du fichier
 config.read(CONFIG_FILE)
@@ -32,9 +37,6 @@ EMAIL_RECIPIENTS = config[EMAIL_SECTION]["recipients"].split(",")
 # Créer l'objet yagmail
 yag = yagmail.SMTP(EMAIL_USER, EMAIL_PASSWORD, EMAIL_HOST)
 
-# Liste pour stocker les informations des nouveaux films (évite les doublons)
-new_movies_info = []
-
 app = FastAPI()
 
 logging.basicConfig(level=logging.DEBUG)
@@ -42,7 +44,7 @@ logging.basicConfig(level=logging.DEBUG)
 # Fonction pour envoyer un email en HTML avec les informations des films
 def send_email():
     try:
-        if new_movies_info:
+        if os.path.getsize("newmovies.txt") > 0:
             # Construction du corps du mail en HTML avec une structure correcte
             body = """\
 <!DOCTYPE html>
@@ -58,10 +60,11 @@ def send_email():
     <ul>"""
             attachments = []
 
-            for movie in new_movies_info:
-                title = movie.get("title")
-                year = movie.get("year")
-                image_path = movie.get("image_path")
+            # Lire les données du fichier
+            with open("newmovies.txt", "r") as newmoviestxt:
+                for movie in newmoviestxt:
+                    moviesplit = movie.strip().split(";")
+                    title, year, image_path = moviesplit[0], moviesplit[1], moviesplit[2]
                 
                 # Ajout des informations dans le corps du mail HTML et la version texte
                 body += f"<li style=\"color:black;\"><strong>{title} ({year})</strong><br>"
@@ -76,14 +79,13 @@ def send_email():
             
             body += "</ul></body></html>"
 
-            
             # Envoi de l'email avec le contenu HTML et les images en inline, plus une version texte
             yag.send(
                 to=EMAIL_RECIPIENTS, 
                 subject="Nouveaux films ajoutés dans Plex", 
                 contents=[body] + attachments
             )
-            new_movies_info.clear()  # Vider la liste après l'envoi de l'email
+            open("newmovies.txt", "w").close()
     except Exception as e:
         logging.error(f"Erreur lors de l'envoi de l'email: {e}", exc_info=True)
 
@@ -98,7 +100,7 @@ scheduler_thread = threading.Thread(target=run_scheduler)
 scheduler_thread.start()
 
 # Planifier l'envoi d'un email à la fin de chaque jour
-schedule.every().day.at("23:59").do(send_email)
+schedule.every().day.at("19:30").do(send_email)
 
 class Account(BaseModel):
     id: int
@@ -110,30 +112,30 @@ class Server(BaseModel):
     uuid: str
 
 class Metadata(BaseModel):
-    librarySectionType: Optional[str]
+    librarySectionType: Optional[str] = None
     ratingKey: str
     key: str
     guid: str
     slug: str
-    studio: Optional[str]
+    studio: Optional[str] = None
     type: str
     title: str
     titleSort: Optional[str] = None
-    librarySectionTitle: Optional[str]
-    librarySectionID: Optional[int]
-    librarySectionKey: Optional[str]
+    librarySectionTitle: Optional[str] = None
+    librarySectionID: Optional[int] = None
+    librarySectionKey: Optional[str] = None
     originalTitle: Optional[str] = None
-    contentRating: Optional[str]
-    summary: Optional[str]
+    contentRating: Optional[str] = None
+    summary: Optional[str] = None
     audienceRating: Optional[float] = None
     year: int
-    tagline: Optional[str]
-    thumb: Optional[str]
-    art: Optional[str]
-    duration: Optional[int]
-    originallyAvailableAt: Optional[str]
-    addedAt: Optional[int]
-    updatedAt: Optional[int]
+    tagline: Optional[str] = None
+    thumb: Optional[str] = None
+    art: Optional[str] = None
+    duration: Optional[int] = None
+    originallyAvailableAt: Optional[str] = None
+    addedAt: Optional[int] = None
+    updatedAt: Optional[int] = None
 
 class WebhookPayload(BaseModel):
     event: str
@@ -151,26 +153,27 @@ async def handle_webhook(
 ):
     logging.info(f"Requête reçue avec les en-têtes : {request.headers}")
 
-    if payload:
-        logging.debug(f"Données brutes reçues : {payload}")
-    else:
+    if not payload:
         logging.error("Aucune donnée payload reçue.")
         raise HTTPException(status_code=400, detail="Données manquantes : payload")
 
     try:
+        # Charger les données du formulaire
         form_data = await request.form()
         logging.info(f"Données reçues : {form_data}")
 
-        # Chargement des données de payload en tant que dictionnaire
+        # Extraire et décoder les données de payload
         payload_data = form_data.get("payload")
-        if payload_data:
-            logging.debug(f"Données payload : {payload_data}")
-        else:
+        if not payload_data:
             logging.error("Données manquantes dans le payload.")
             raise HTTPException(status_code=400, detail="Données manquantes dans le payload")
 
+        # Vérifier la présence de `contentRating` et autres champs optionnels
+        payload_dict = json.loads(payload_data)
+        payload_dict["Metadata"]["contentRating"] = payload_dict["Metadata"].get("contentRating", None)
+
         # Décodage du JSON payload
-        payload_obj = WebhookPayload.parse_raw(payload_data)
+        payload_obj = WebhookPayload(**payload_dict)
 
         # Filtrer et ignorer les événements qui ne sont pas de type "library.new"
         if payload_obj.event != "library.new":
@@ -180,23 +183,20 @@ async def handle_webhook(
         # Extraire le titre et l'année du film
         title = payload_obj.Metadata.title
         year = payload_obj.Metadata.year
+        
 
         # Si une image est envoyée dans le formulaire
         image_path = None
         if thumb:
             image_bytes = await thumb.read()
-            # Sauvegarder l'image localement (par exemple dans un dossier "images")
             image_path = f"images/{title}_{year}.jpg"
             with open(image_path, "wb") as f:
                 f.write(image_bytes)
             logging.info(f"Image reçue et sauvegardée : {image_path}")
 
-        # Ajouter les informations du film à la liste new_movies_info
-        new_movies_info.append({
-            "title": title,
-            "year": year,
-            "image_path": image_path
-        })
+        # Ajouter les informations du film au fichier texte newmovies.txt
+        with open("newmovies.txt", "a") as newmoviestxt:
+            newmoviestxt.write(title + ";" + str(year) + ";" + image_path + "\n")
 
         logging.info(f"Traitement réussi : Titre = {title}, Année = {year}")
 
